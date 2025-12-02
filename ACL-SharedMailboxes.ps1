@@ -1,360 +1,701 @@
-<#======================================================================================
-ACL-SharedMailboxes v1.0.1                                                    2022-03-07
-----------------------------------------------------------------------------------------
-Author: /u/bwientjes
-======================================================================================#>
+<#
+.SYNOPSIS
+    Manages Microsoft 365 shared mailbox permissions based on an Excel configuration matrix.
 
-# Where to find the input Excel workbook
-$excelSourceFile                        = ".\ACL-SharedMailboxes.xlsx"                          # Path to input Excel workbook
+.DESCRIPTION
+    ACL-SharedMailboxes automates the management of shared mailbox permissions in Microsoft 365 by:
+    - Reading configuration from an Excel workbook in ACL-matrix format
+    - Querying Active Directory for users/groups based on flexible criteria
+    - Comparing current vs. desired permissions state
+    - Synchronizing permissions to match the Excel configuration
 
-# Layout settings
-$colorText                              = "Cyan"
-$colorOK                                = "Green"
-$colorError                             = "Red"
+    The script supports two permission types:
+    - Read and Manage (R) - Grants FullAccess permission
+    - Send As (S) - Grants SendAs permission
 
-# Office365 credentials
-$msol_URI								= "https://outlook.office365.com/powershell-liveid/"	# FQDN of Exchange Client Access Server
-$msol_Auth								= "Basic"											    # "Kerberos" or "Basic"
-$msol_UserName							= "msol_user@company.com"                               # Microsoft Online user	(this user needs the Exchange Online Admin role in AzureAD)	   
+.PARAMETER ExcelSourceFile
+    Path to the Excel workbook containing the permission matrix configuration.
 
+.PARAMETER UserPrincipalName
+    Microsoft 365 admin account username (UPN) with Exchange Online Admin role.
+    If not specified, you'll be prompted to authenticate interactively.
 
-<#======================================================================================
-Do not edit under this section unless you know what you're doing!
-======================================================================================#>
+.PARAMETER Organization
+    The Exchange Online organization name (e.g., contoso.onmicrosoft.com).
+    Optional parameter for specifying the tenant.
 
-# Internal variables
-$WorkingDirectory    					    = Split-Path ((Get-Variable MyInvocation).Value).MyCommand.Path
-$EncryptedPassword_File					    = "EncryptedPassword.txt"
-$EncryptedPassword_LocalFile			    = Join-Path $WorkingDirectory $EncryptedPassword_File
+.PARAMETER CertificateThumbprint
+    Certificate thumbprint for certificate-based authentication (CBA).
+    Use this for unattended/automated scenarios instead of interactive auth.
 
-Function ConnectExchange($msol_URI, $msol_UserName, $EncryptedPassword_LocalFile, $msol_Auth) {
-    Write-Host "Check for Microsoft 365 connectivity..." -ForegroundColor $colorText
+.PARAMETER AppId
+    Application (client) ID for certificate-based authentication.
+    Required when using -CertificateThumbprint.
 
-    Try {
-        $Session = Get-OutboundConnector -ErrorAction SilentlyContinue | Out-null
-        Write-Host "Already connected." -ForegroundColor $colorText
+.EXAMPLE
+    .\ACL-SharedMailboxes.ps1
+    Runs the script with interactive authentication.
+
+.EXAMPLE
+    .\ACL-SharedMailboxes.ps1 -UserPrincipalName admin@contoso.com
+    Runs the script with the specified user principal name.
+
+.EXAMPLE
+    .\ACL-SharedMailboxes.ps1 -AppId "12345678-1234-1234-1234-123456789012" -CertificateThumbprint "A1B2C3..." -Organization "contoso.onmicrosoft.com"
+    Runs the script using certificate-based authentication for automation scenarios.
+
+.NOTES
+    Version:        3.0.0
+    Author:         /u/bwientjes
+    Updated:        2025-12-02
+
+    Prerequisites:
+    - ExchangeOnlineManagement module (v3.0.0 or later)
+    - PSExcel PowerShell module
+    - Active Directory module
+    - Exchange Online Admin role in Azure AD
+
+    Breaking Changes from v2.0:
+    - Now uses ExchangeOnlineManagement module instead of deprecated Remote PowerShell (RPS)
+    - Removed Basic authentication (deprecated by Microsoft)
+    - Uses modern authentication with MFA support
+    - Certificate-based authentication available for automation
+
+.LINK
+    https://github.com/baswientjes/PS_ACL-SharedMailboxes
+#>
+
+[CmdletBinding(DefaultParameterSetName = 'Interactive')]
+param(
+    [Parameter()]
+    [ValidateScript({Test-Path -Path $_ -PathType Leaf})]
+    [string]$ExcelSourceFile = ".\ACL-SharedMailboxes.xlsx",
+
+    [Parameter(ParameterSetName = 'Interactive')]
+    [string]$UserPrincipalName,
+
+    [Parameter(ParameterSetName = 'Interactive')]
+    [string]$Organization,
+
+    [Parameter(Mandatory, ParameterSetName = 'CertificateAuth')]
+    [string]$AppId,
+
+    [Parameter(Mandatory, ParameterSetName = 'CertificateAuth')]
+    [string]$CertificateThumbprint,
+
+    [Parameter(Mandatory, ParameterSetName = 'CertificateAuth')]
+    [string]$Organization
+)
+
+#Requires -Modules ExchangeOnlineManagement, PSExcel, ActiveDirectory
+
+# Script-level variables
+$script:WorkingDirectory = Split-Path -Path $MyInvocation.MyCommand.Path -Parent
+$script:TempExcelFile = Join-Path -Path $script:WorkingDirectory -ChildPath "input.xlsx"
+
+# Color settings for console output
+$script:ColorText = "Cyan"
+$script:ColorOK = "Green"
+$script:ColorError = "Red"
+
+#region Functions
+
+function Connect-M365ExchangeOnline {
+    <#
+    .SYNOPSIS
+        Establishes a connection to Exchange Online using the ExchangeOnlineManagement module.
+
+    .DESCRIPTION
+        Connects to Exchange Online using modern authentication. Supports both interactive
+        authentication (with MFA) and certificate-based authentication for automation scenarios.
+
+    .PARAMETER UserPrincipalName
+        The user principal name for interactive authentication.
+
+    .PARAMETER Organization
+        The Exchange Online organization name.
+
+    .PARAMETER AppId
+        Application (client) ID for certificate-based authentication.
+
+    .PARAMETER CertificateThumbprint
+        Certificate thumbprint for certificate-based authentication.
+
+    .EXAMPLE
+        Connect-M365ExchangeOnline -UserPrincipalName "admin@contoso.com"
+
+    .EXAMPLE
+        Connect-M365ExchangeOnline -AppId "12345" -CertificateThumbprint "ABC123" -Organization "contoso.onmicrosoft.com"
+    #>
+    [CmdletBinding(DefaultParameterSetName = 'Interactive')]
+    param(
+        [Parameter(ParameterSetName = 'Interactive')]
+        [string]$UserPrincipalName,
+
+        [Parameter(ParameterSetName = 'Interactive')]
+        [string]$Organization,
+
+        [Parameter(Mandatory, ParameterSetName = 'CertificateAuth')]
+        [string]$AppId,
+
+        [Parameter(Mandatory, ParameterSetName = 'CertificateAuth')]
+        [string]$CertificateThumbprint,
+
+        [Parameter(Mandatory, ParameterSetName = 'CertificateAuth')]
+        [string]$Organization
+    )
+
+    Write-Verbose "Checking for existing Exchange Online connectivity..."
+    Write-Host "Checking for Microsoft 365 Exchange Online connectivity..." -ForegroundColor $script:ColorText
+
+    try {
+        # Test if already connected by trying to get a mailbox
+        $null = Get-OrganizationConfig -ErrorAction Stop
+        Write-Host "Already connected to Exchange Online." -ForegroundColor $script:ColorText
+        return
     }
-    Catch {
-        if (!$Session) {
-            Write-Host "No active session found." -ForegroundColor $colorText
-            Write-Host "Starting new PowerShell session..." -ForegroundColor $colorText
-        
-            If (!(Test-Path $EncryptedPassword_LocalFile)) { 
-                Write-Host "$EncryptedPassword_File not found" -ForegroundColor $colorError
-                Read-Host -Prompt "Enter password for user $msol_UserName" -AsSecureString | ConvertFrom-SecureString | Out-File $EncryptedPassword_LocalFile
-                
-                $msol_Password    = Get-Content $EncryptedPassword_LocalFile | ConvertTo-SecureString
-                $msol_Credentials = New-Object -typename System.Management.Automation.PSCredential `
-                                               -argumentlist $msol_UserName, $msol_Password
-            
-            } Else {
-                $msol_Password    = Get-Content $EncryptedPassword_LocalFile | ConvertTo-SecureString
-                $msol_Credentials = New-Object -typename System.Management.Automation.PSCredential `
-                                               -argumentlist $msol_UserName, $msol_Password
+    catch {
+        Write-Verbose "No active connection found. Establishing new connection..."
+        Write-Host "No active connection found." -ForegroundColor $script:ColorText
+        Write-Host "Connecting to Exchange Online..." -ForegroundColor $script:ColorText
+
+        try {
+            # Build connection parameters based on authentication method
+            $connectionParams = @{
+                ShowBanner = $false
+                ErrorAction = 'Stop'
             }
-            Try {
-                $PSSession = New-PSSession -ConfigurationName Microsoft.Exchange `
-                                           -ConnectionUri $msol_URI `
-                                           -Credential $msol_Credentials `
-                                           -Authentication $msol_Auth `
-                                           -AllowRedirection `
-                                           -Name "ACLSharedMailboxes"
-            
-                Import-PSSession $PSSession -AllowClobber -DisableNameChecking | Out-null
-                                
-                $Session = Get-PSSession -Name "ACLSharedMailboxes" -ErrorAction Stop
-                Write-Host "Session started" -ForegroundColor $colorOK
+
+            if ($PSCmdlet.ParameterSetName -eq 'CertificateAuth') {
+                # Certificate-based authentication for automation
+                $connectionParams['AppId'] = $AppId
+                $connectionParams['CertificateThumbprint'] = $CertificateThumbprint
+                $connectionParams['Organization'] = $Organization
+                Write-Verbose "Using certificate-based authentication"
             }
-            Catch  {
-                Write-Host "!- Canot connect to Microsoft 365 -!" -ForegroundColor $colorError
-                Write-Host "Double check your credentials. You can delete the ExcryptedPassword.txt file to have the script prompt for a password again." -ForegroundColor $colorError
-                
-				Scheduledtaskcode "1" ;# Last Run Result = 0x1
-                break
+            else {
+                # Interactive authentication with MFA support
+                if ($UserPrincipalName) {
+                    $connectionParams['UserPrincipalName'] = $UserPrincipalName
+                }
+                if ($Organization) {
+                    $connectionParams['Organization'] = $Organization
+                }
+                Write-Verbose "Using interactive authentication"
             }
-        
+
+            # Connect to Exchange Online
+            Connect-ExchangeOnline @connectionParams
+
+            # Verify connection
+            $null = Get-OrganizationConfig -ErrorAction Stop
+            Write-Host "Successfully connected to Exchange Online" -ForegroundColor $script:ColorOK
+        }
+        catch {
+            Write-Host "!- Cannot connect to Exchange Online -!" -ForegroundColor $script:ColorError
+            Write-Host "Error: $_" -ForegroundColor $script:ColorError
+            Write-Error "Failed to establish Exchange Online connection: $_"
+            throw
         }
     }
 }
 
-Function CloseConnectionExchange() {
-    Write-Host ""
-	Write-Host "Disconnect the Remote PowerShell session: " -NoNewLine -ForegroundColor $colorText
-	Remove-PSSession -Name "ACLSharedMailboxes"
-	Write-Host "OK" -ForegroundColor $colorOK
+function Disconnect-M365ExchangeOnline {
+    <#
+    .SYNOPSIS
+        Closes the Exchange Online connection.
+
+    .DESCRIPTION
+        Disconnects from Exchange Online and cleans up the session.
+
+    .EXAMPLE
+        Disconnect-M365ExchangeOnline
+    #>
+    [CmdletBinding()]
+    param()
+
+    try {
+        Write-Verbose "Disconnecting from Exchange Online..."
+        Write-Host "`nDisconnecting from Exchange Online: " -NoNewline -ForegroundColor $script:ColorText
+        Disconnect-ExchangeOnline -Confirm:$false -ErrorAction Stop
+        Write-Host "OK" -ForegroundColor $script:ColorOK
+    }
+    catch {
+        Write-Warning "Could not disconnect session: $_"
+    }
 }
 
-Function SearchUsers($class, $field, $searchTerm, $recursive) {
+function Find-ADUsers {
     <#
-    Takes a user class, a field to search in, a search term, and wether or not searches should be done recursively
-    ald returns an object list of users that are found.
+    .SYNOPSIS
+        Searches Active Directory for users or groups based on criteria.
+
+    .DESCRIPTION
+        Queries Active Directory for users or groups matching the specified field and search term.
+        Supports recursive group membership expansion.
+
+    .PARAMETER Class
+        The object class to search for (User or Group).
+
+    .PARAMETER Field
+        The AD property to search in (e.g., Name, Department, Title).
+
+    .PARAMETER SearchTerm
+        The value to search for (supports wildcards).
+
+    .PARAMETER Recursive
+        Whether to recursively expand group memberships.
+
+    .PARAMETER RowIndex
+        The Excel row index being processed (for error messages).
+
+    .OUTPUTS
+        System.Array of user objects with UserPrincipalName property.
+
+    .EXAMPLE
+        Find-ADUsers -Class 'Group' -Field 'Name' -SearchTerm 'Sales*' -Recursive $true -RowIndex 2
     #>
-    $sourceList = @()
+    [CmdletBinding()]
+    [OutputType([System.Array])]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet('User', 'Group')]
+        [string]$Class,
 
-    switch($class) {
+        [Parameter(Mandatory)]
+        [string]$Field,
 
-        'Group' {
-            # Check is groups are found.
-            $groupsFound = Get-ADGroup -Filter "${field} -like '${searchTerm}'" -ErrorAction 'silentlycontinue'
-            if($groupsFound) {
-                # If the group exists, add all members of the group.
-                Get-ADGroup -Filter "${field} -like '${searchTerm}'" | ForEach-Object {
-                    if($recursive -eq 'Yes') {
-                        Get-ADGroupMember -Identity $_.Name -Recursive | Select-Object UserPrincipalName | ForEach-Object {
-                            $sourceList += $_
+        [Parameter(Mandatory)]
+        [string]$SearchTerm,
+
+        [Parameter(Mandatory)]
+        [bool]$Recursive,
+
+        [Parameter()]
+        [int]$RowIndex
+    )
+
+    $userList = @()
+
+    try {
+        switch ($Class) {
+            'Group' {
+                Write-Verbose "Searching for groups where $Field is like '$SearchTerm'"
+                $groups = Get-ADGroup -Filter "$Field -like '$SearchTerm'" -ErrorAction Stop
+
+                if ($groups) {
+                    foreach ($group in $groups) {
+                        Write-Verbose "Processing group: $($group.Name)"
+
+                        if ($Recursive) {
+                            $members = Get-ADGroupMember -Identity $group.Name -Recursive -ErrorAction Stop |
+                                       Select-Object -Property UserPrincipalName
                         }
-                    } else {
-                        Get-ADGroupMember -Identity $_.Name | Select-Object UserPrincipalName | Where-Object objectClass -eq "user" | ForEach-Object {
-                            $sourceList += $_
+                        else {
+                            $members = Get-ADGroupMember -Identity $group.Name -ErrorAction Stop |
+                                       Where-Object -Property objectClass -EQ 'user' |
+                                       Select-Object -Property UserPrincipalName
                         }
+
+                        $userList += $members
                     }
                 }
-            } else {
-                Write-Host ""
-                Write-Host "Groups with ${field} of '${searchTerm}' do not exist. Skipping row ${rowIndex}." -ForegroundColor Red
-            }
-            Break
-        }
-    
-        'User' {
-            # Check is users are found.
-            $usersFound = Get-ADUser -Filter "${field} -like '${searchTerm}'" -ErrorAction 'silentlycontinue'
-            if($usersFound) {
-                # If a user is found, add it to the source list.
-                Get-ADUser -Filter "${field} -like '${searchTerm}'" | Select-Object UserPrincipalName | ForEach-Object {
-                    $sourceList += $_
+                else {
+                    Write-Host "`nGroups with $Field of '$SearchTerm' do not exist. Skipping row $RowIndex." -ForegroundColor $script:ColorError
                 }
-            } else {
-                Write-Host ""
-                Write-Host "Users with ${field} of '${searchTerm}' do not exist. Skipping row ${rowIndex}." -ForegroundColor Red
             }
-            Break
+
+            'User' {
+                Write-Verbose "Searching for users where $Field is like '$SearchTerm'"
+                $users = Get-ADUser -Filter "$Field -like '$SearchTerm'" -ErrorAction Stop |
+                         Select-Object -Property UserPrincipalName
+
+                if ($users) {
+                    $userList += $users
+                }
+                else {
+                    Write-Host "`nUsers with $Field of '$SearchTerm' do not exist. Skipping row $RowIndex." -ForegroundColor $script:ColorError
+                }
+            }
         }
-    
+    }
+    catch {
+        Write-Error "Error searching AD for $Class with $Field='$SearchTerm': $_"
     }
 
-    Return $sourceList
+    return $userList
 }
 
-Function GeneratedUserLists() {
+function Get-UserListsFromWorksheet {
+    <#
+    .SYNOPSIS
+        Generates user lists from Excel worksheet configuration.
+
+    .DESCRIPTION
+        Reads the worksheet configuration rows and builds a hashtable of user lists
+        indexed by row number, based on the AD search criteria in columns A-E.
+
+    .PARAMETER Worksheet
+        The Excel worksheet object to process.
+
+    .OUTPUTS
+        System.Collections.Hashtable of user lists indexed by row number.
+
+    .EXAMPLE
+        Get-UserListsFromWorksheet -Worksheet $worksheet
+    #>
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param(
+        [Parameter(Mandatory)]
+        [object]$Worksheet
+    )
+
     $userLists = @{}
-    for($rowIndex=2; $rowIndex -le $worksheet.Dimension.Rows; $rowIndex++) {
 
-        # Get the search term for this rights assignment
-        $class          = $worksheet.Cells.Item($rowIndex,1).text
-        $field          = $worksheet.Cells.Item($rowIndex,2).text
-        $searchTerm     = $worksheet.Cells.Item($rowIndex,3).text
-        $recursive      = $worksheet.Cells.Item($rowIndex,4).text
-        $active         = $worksheet.Cells.Item($rowIndex,5).text
+    for ($rowIndex = 2; $rowIndex -le $Worksheet.Dimension.Rows; $rowIndex++) {
+        # Get the search criteria for this row
+        $class = $Worksheet.Cells.Item($rowIndex, 1).Text
+        $field = $Worksheet.Cells.Item($rowIndex, 2).Text
+        $searchTerm = $Worksheet.Cells.Item($rowIndex, 3).Text
+        $recursiveText = $Worksheet.Cells.Item($rowIndex, 4).Text
+        $active = $Worksheet.Cells.Item($rowIndex, 5).Text
 
-        # Only proceed if all fields are filled and $active is set to 'Yes', otherwise we have either an inactive row or incomplete information.
-        if(($class -ne '') -and ($field -ne '') -and ($searchTerm -ne '') -and ($recursive -ne '') -and ($active -eq 'Yes')) {
-            $userList = SearchUsers $class $field $searchTerm $recursive
-            $userLists.Add($rowIndex,$userList)
+        # Only proceed if all fields are filled and row is active
+        if ($class -and $field -and $searchTerm -and $recursiveText -and ($active -eq 'Yes')) {
+            $recursive = $recursiveText -eq 'Yes'
+
+            Write-Verbose "Processing row $rowIndex : Class=$class, Field=$field, SearchTerm=$searchTerm, Recursive=$recursive"
+
+            $userList = Find-ADUsers -Class $class -Field $field -SearchTerm $searchTerm -Recursive $recursive -RowIndex $rowIndex
+            $userLists.Add($rowIndex, $userList)
         }
-
     }
 
-    Return $userLists
-
+    return $userLists
 }
 
+function Sync-MailboxPermissions {
+    <#
+    .SYNOPSIS
+        Synchronizes mailbox permissions to match desired state.
 
-# First and foremost, we need functionality from the PSExcel module.
-Import-Module "PSExcel"
+    .DESCRIPTION
+        Compares current mailbox permissions with desired permissions and adds/removes
+        users as needed to match the configuration.
 
-# Put some pretty header on the console
-Clear-Host
-Write-Host "ACL-SharedMailboxes v1.0.1" -ForegroundColor $colorText
-Write-Host "-------------------------------------------------------------------------------------" -ForegroundColor $colorText
-Write-Host ""
-Write-Host "Read Excel workbook: " -ForegroundColor $colorText -NoNewline
-Write-Host $excelSourceFile -ForegroundColor White
-Write-Host ""
-ConnectExchange $msol_URI $msol_UserName $EncryptedPassword_LocalFile $msol_Auth
-Write-Host ""
+    .PARAMETER MailboxName
+        The email address of the shared mailbox.
 
-# Now that we have Excel cmdlets through PSExcel, let's open the workbook. First, make a local copy so that the script won't fail when someone has the workbook open.
-Copy-Item $excelSourceFile ".\input.xslx"
-$excelObject = New-Excel -Path ".\input.xslx"
-$workbook = $excelObject | Get-Workbook
+    .PARAMETER DesiredReadUsers
+        Array of user principal names who should have Read and Manage access.
 
-ForEach($worksheet in @($workbook.Worksheets)) {
-    $worksheetName = $worksheet.Name
-    # Only process worksheets without the # (skip) prefix, i.e. worksheets whose names are preceded with # are skipped.
-    if($worksheetName -notlike "#*") {
+    .PARAMETER DesiredSendAsUsers
+        Array of user principal names who should have Send As access.
 
-        Write-Host "Worksheet: " -ForegroundColor $colorText -NoNewLine
+    .EXAMPLE
+        Sync-MailboxPermissions -MailboxName 'sales@company.com' -DesiredReadUsers @('user1@company.com') -DesiredSendAsUsers @('user2@company.com')
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$MailboxName,
+
+        [Parameter()]
+        [string[]]$DesiredReadUsers = @(),
+
+        [Parameter()]
+        [string[]]$DesiredSendAsUsers = @()
+    )
+
+    Write-Verbose "Syncing permissions for mailbox: $MailboxName"
+
+    try {
+        # Get current permissions
+        $currentReadPermissions = Get-MailboxPermission -Identity $MailboxName -ErrorAction Stop |
+                                  Where-Object {$_.User -ne 'NT AUTHORITY\SELF'} |
+                                  Select-Object -ExpandProperty User
+
+        $currentSendAsPermissions = Get-RecipientPermission -Identity $MailboxName -ErrorAction Stop |
+                                    Where-Object {$_.Trustee -ne 'NT AUTHORITY\SELF'} |
+                                    Select-Object -ExpandProperty Trustee
+
+        # Calculate differences for Read permissions
+        $readToRemove = @()
+        $readToAdd = @()
+
+        if ($DesiredReadUsers.Count -gt 0 -and $currentReadPermissions.Count -gt 0) {
+            $comparison = Compare-Object -ReferenceObject $currentReadPermissions -DifferenceObject $DesiredReadUsers
+            $readToRemove = $comparison | Where-Object {$_.SideIndicator -eq '<='} | Select-Object -ExpandProperty InputObject
+            $readToAdd = $comparison | Where-Object {$_.SideIndicator -eq '=>'} | Select-Object -ExpandProperty InputObject
+        }
+        elseif ($DesiredReadUsers.Count -eq 0) {
+            $readToRemove = $currentReadPermissions
+        }
+        elseif ($currentReadPermissions.Count -eq 0) {
+            $readToAdd = $DesiredReadUsers
+        }
+
+        # Calculate differences for Send As permissions
+        $sendAsToRemove = @()
+        $sendAsToAdd = @()
+
+        if ($DesiredSendAsUsers.Count -gt 0 -and $currentSendAsPermissions.Count -gt 0) {
+            $comparison = Compare-Object -ReferenceObject $currentSendAsPermissions -DifferenceObject $DesiredSendAsUsers
+            $sendAsToRemove = $comparison | Where-Object {$_.SideIndicator -eq '<='} | Select-Object -ExpandProperty InputObject
+            $sendAsToAdd = $comparison | Where-Object {$_.SideIndicator -eq '=>'} | Select-Object -ExpandProperty InputObject
+        }
+        elseif ($DesiredSendAsUsers.Count -eq 0) {
+            $sendAsToRemove = $currentSendAsPermissions
+        }
+        elseif ($currentSendAsPermissions.Count -eq 0) {
+            $sendAsToAdd = $DesiredSendAsUsers
+        }
+
+        # Remove Read and Manage permissions
+        Update-PermissionSet -MailboxName $MailboxName -Users $readToRemove -PermissionType 'Read' -Action 'Remove'
+
+        # Remove Send As permissions
+        Update-PermissionSet -MailboxName $MailboxName -Users $sendAsToRemove -PermissionType 'SendAs' -Action 'Remove'
+
+        # Add Read and Manage permissions
+        Update-PermissionSet -MailboxName $MailboxName -Users $readToAdd -PermissionType 'Read' -Action 'Add'
+
+        # Add Send As permissions
+        Update-PermissionSet -MailboxName $MailboxName -Users $sendAsToAdd -PermissionType 'SendAs' -Action 'Add'
+    }
+    catch {
+        Write-Error "Failed to sync permissions for mailbox $MailboxName : $_"
+    }
+}
+
+function Update-PermissionSet {
+    <#
+    .SYNOPSIS
+        Adds or removes a set of permissions for a mailbox.
+
+    .DESCRIPTION
+        Processes a list of users to add or remove specific permission types from a mailbox
+        with progress indication.
+
+    .PARAMETER MailboxName
+        The email address of the shared mailbox.
+
+    .PARAMETER Users
+        Array of user principal names to process.
+
+    .PARAMETER PermissionType
+        Type of permission (Read or SendAs).
+
+    .PARAMETER Action
+        Action to perform (Add or Remove).
+
+    .EXAMPLE
+        Update-PermissionSet -MailboxName 'sales@company.com' -Users @('user@company.com') -PermissionType 'Read' -Action 'Add'
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$MailboxName,
+
+        [Parameter()]
+        [string[]]$Users = @(),
+
+        [Parameter(Mandatory)]
+        [ValidateSet('Read', 'SendAs')]
+        [string]$PermissionType,
+
+        [Parameter(Mandatory)]
+        [ValidateSet('Add', 'Remove')]
+        [string]$Action
+    )
+
+    $numberOfUsers = $Users.Count
+
+    if ($numberOfUsers -eq 0) {
+        $permissionLabel = if ($PermissionType -eq 'Read') { 'Read and Manage' } else { 'Send As' }
+        Write-Host "  - No users to be ${Action}ed from/to '$permissionLabel'" -ForegroundColor $script:ColorOK
+        return
+    }
+
+    $permissionLabel = if ($PermissionType -eq 'Read') { 'Read and Manage' } else { 'Send As' }
+    $activityMessage = "  - $Action $numberOfUsers user(s) to/from '$permissionLabel'"
+
+    try {
+        $processedCount = 0
+        foreach ($user in $Users) {
+            $processedCount++
+            $percentComplete = ($processedCount / $numberOfUsers) * 100
+            Write-Progress -Activity $activityMessage -Status "$processedCount of $numberOfUsers" -PercentComplete $percentComplete
+
+            if ($PermissionType -eq 'Read') {
+                if ($Action -eq 'Add') {
+                    $null = Add-MailboxPermission -Identity $MailboxName -User $user -AccessRights FullAccess -InheritanceType All -Confirm:$false -ErrorAction Stop
+                }
+                else {
+                    $null = Remove-MailboxPermission -Identity $MailboxName -User $user -AccessRights FullAccess -InheritanceType All -Confirm:$false -ErrorAction Stop
+                }
+            }
+            else {
+                if ($Action -eq 'Add') {
+                    $null = Add-RecipientPermission -Identity $MailboxName -Trustee $user -AccessRights SendAs -Confirm:$false -ErrorAction Stop
+                }
+                else {
+                    $null = Remove-RecipientPermission -Identity $MailboxName -Trustee $user -AccessRights SendAs -Confirm:$false -ErrorAction Stop
+                }
+            }
+        }
+
+        Write-Progress -Activity $activityMessage -Completed
+        Write-Host "  - $Action $numberOfUsers user(s) to/from '$permissionLabel': " -NoNewline -ForegroundColor $script:ColorText
+        Write-Host "OK" -ForegroundColor $script:ColorOK
+    }
+    catch {
+        Write-Progress -Activity $activityMessage -Completed
+        Write-Error "Failed to $Action permission for mailbox $MailboxName : $_"
+    }
+}
+
+#endregion Functions
+
+#region Main Script
+
+try {
+    # Display header
+    Clear-Host
+    Write-Host "ACL-SharedMailboxes v3.0.0" -ForegroundColor $script:ColorText
+    Write-Host "-------------------------------------------------------------------------------------" -ForegroundColor $script:ColorText
+    Write-Host ""
+    Write-Host "Read Excel workbook: " -ForegroundColor $script:ColorText -NoNewline
+    Write-Host $ExcelSourceFile -ForegroundColor White
+    Write-Host ""
+
+    # Import required modules
+    Write-Verbose "Importing required modules..."
+    Import-Module ExchangeOnlineManagement -ErrorAction Stop
+    Import-Module PSExcel -ErrorAction Stop
+
+    # Connect to Exchange Online
+    $connectionParams = @{}
+    if ($PSCmdlet.ParameterSetName -eq 'CertificateAuth') {
+        $connectionParams['AppId'] = $AppId
+        $connectionParams['CertificateThumbprint'] = $CertificateThumbprint
+        $connectionParams['Organization'] = $Organization
+    }
+    else {
+        if ($UserPrincipalName) {
+            $connectionParams['UserPrincipalName'] = $UserPrincipalName
+        }
+        if ($Organization) {
+            $connectionParams['Organization'] = $Organization
+        }
+    }
+
+    Connect-M365ExchangeOnline @connectionParams
+    Write-Host ""
+
+    # Create temporary copy of Excel file to avoid locking issues
+    Write-Verbose "Creating temporary copy of Excel workbook..."
+    Copy-Item -Path $ExcelSourceFile -Destination $script:TempExcelFile -Force -ErrorAction Stop
+
+    # Open the Excel workbook
+    $excelObject = New-Excel -Path $script:TempExcelFile
+    $workbook = $excelObject | Get-Workbook
+
+    # Process each worksheet
+    foreach ($worksheet in $workbook.Worksheets) {
+        $worksheetName = $worksheet.Name
+
+        # Skip worksheets with # prefix
+        if ($worksheetName -like '#*') {
+            Write-Verbose "Skipping worksheet: $worksheetName"
+            continue
+        }
+
+        Write-Host "Worksheet: " -ForegroundColor $script:ColorText -NoNewline
         Write-Host $worksheetName -ForegroundColor White
         Write-Host ""
 
-        # Generate a hashtable that contains arrays of user objects as defined in the first few columns in the Excel workbook.
-        # The key index corresponds with a row numer (i.e. $userLists[2] is the aggregated user list according to the search on row 2).
-        # These lists will later be used to provide access (after concatenating a set of lists and sanitizing them).
-        Write-Host "Generating user lists based on information entered in columns A through E..." -ForegroundColor $colorText
-        $userLists = GeneratedUserLists
+        # Generate user lists based on columns A-E
+        Write-Host "Generating user lists based on information entered in columns A through E..." -ForegroundColor $script:ColorText
+        $userLists = Get-UserListsFromWorksheet -Worksheet $worksheet
 
-        # Process all columns, staring at column 6 (containing shared mailbox adresses).
-        for($colIndex=6; $colIndex -le $worksheet.Dimension.Columns; $colIndex++) {
+        # Process each shared mailbox (starting from column 6)
+        for ($colIndex = 6; $colIndex -le $worksheet.Dimension.Columns; $colIndex++) {
+            $sharedMailboxName = $worksheet.Cells.Item(1, $colIndex).Text
 
-            # Check if the cell is filled. Skip empty ones.
-            $sharedMailBoxName = $worksheet.Cells.Item(1,$colIndex).text
-            if($sharedMailBoxName -ne '') {
-
-                Write-Host ""
-                Write-Host "Shared Mailbox: " -ForegroundColor $colorText -NoNewline
-                Write-Host $sharedMailBoxName -ForegroundColor White
-
-                # Clear the user lists so that we can fill them.
-                $newRead = @()
-                $newSendAs = @()
-
-                # Now look for filled cells in that column, and construct a list for Reand and Manage access and Sens As access.
-                for($rowIndex=2; $rowIndex -le $worksheet.Dimension.Rows; $rowIndex++) {
-
-                    # Process only active rows.
-                    $activeRow = $worksheet.Cells.Item($rowIndex,5).text
-                    if($activeRow -eq 'Yes') {
-
-                        $rights = $worksheet.Cells.Item($rowIndex,$colIndex).text
-
-                        # Check for Read and Manage rights
-                        if($rights.toLower() -like '*r*') {
-                            $newRead += $userLists[$rowIndex]
-                        }
-    
-                        # Check for Send As rights
-                        if($rights.toLower() -like '*s*') {
-                            $newSendAs += $userLists[$rowIndex]
-                        }
-
-                    }
-    
-                }
-
-                # Cleanup duplicates from the "Read and Manage" and "Send As" lists ($userListRead and $userListSendAs respectively), and select only the UPN (we don't need the rest).
-                $newRead    = $newRead | Sort-Object -Property UserPrincipalName -Unique
-                $newSendAs  = $newSendAs | Sort-Object -Property UserPrincipalName -Unique
-                $newRead    = $newRead.UserPrincipalName    #.toLower() (doesn't work if the array is empty, but this is not case sensitive so it won't matter)
-                $newSendAs  = $newSendAs.UserPrincipalName  #.toLower() (doesn't work if the array is empty, but this is not case sensitive so it won't matter)
-                Write-Host "  -" $newRead.Count "user(s) need 'Read and Manage' access." -ForegroundColor $colorText
-                Write-Host "  -" $newSendAs.Count "user(s) need 'Send As' access." -ForegroundColor $colorText
-
-                # Get the currect "Read and Manage" and "Send As" access for that mailbox, so we can compare them later. Omit the NT AUTHORITY\SELF.
-                $currentRead    = Get-MailboxPermission -Identity $sharedMailBoxName | Select-Object User | Where-Object {($_.User -ne "NT AUTHORITY\SELF")}
-                $currentSendAs  = Get-RecipientPermission -Identity $sharedMailBoxName | Select-Object Trustee | Where-Object {($_.Trustee -ne "NT AUTHORITY\SELF")}
-
-                # Convert any email addresses to lowercase, so that we will be comparing apples to apples later.
-                $currentRead    = $currentRead.User         #.toLower() (doesn't work if the array is empty, but this is not case sensitive so it won't matter)
-                $currentSendAs  = $currentSendAs.Trustee    #.toLower() (doesn't work if the array is empty, but this is not case sensitive so it won't matter)
-
-                # Compare the current and user Read lists to construct an Add and Remove list
-                if(($newRead.Count -gt 0) -and ($currentRead.Count -gt 0)) {
-                    $comparison     = Compare-Object -ReferenceObject $currentRead -DifferenceObject $newRead
-                    $removeRead     = $comparison.where{$_.SideIndicator -eq '<='}.InputObject
-                    $addRead        = $comparison.where{$_.SideIndicator -eq '=>'}.InputObject
-                } elseif($newRead.Count -eq 0) {
-                    $removeRead     = $currentRead
-                } elseif($currentRead.Count -eq 0) {
-                    $addRead        = $newRead
-                }
-
-                # Compare the current and user Send As lists to construct an Add and Remove list
-                if(($newSendAs.Count -gt 0) -and ($currentSendAs.Count -gt 0)) {
-                    $comparison     = Compare-Object -ReferenceObject $currentSendAs -DifferenceObject $newSendAs
-                    $removeSendAs   = $comparison.where{$_.SideIndicator -eq '<='}.InputObject
-                    $addSendAs      = $comparison.where{$_.SideIndicator -eq '=>'}.InputObject
-                } elseif($newSendAs.Count -eq 0) {
-                    $removeSendAs   = $currentSendAs
-                } elseif($currentSendAs.Count -eq 0) {
-                    $addSendAs      = $newSendAs
-                }
-
-                # Remove users that no longer need access to each access type
-                $numberOfUsers = $removeRead.Count
-                if($numberOfUsers -gt 0) {
-                    $pct = 0
-                    $pctstep = 100 / $numberOfUsers
-                    ForEach($user in $removeRead) {
-                        $pct += $pctstep
-                        [int]$step = $pct
-                        Write-Progress -Activity "  - Remove $numberOfUsers user(s) from 'Read and Manage'" -Status "$step%" -PercentComplete $pct
-                        $dummy = Remove-MailboxPermission -Identity $sharedMailBoxName -User $user -AccessRights FullAccess -Confirm:$false
-                    }
-                    Write-Progress -Activity "  - Remove $numberOfUsers user(s) from 'Read and Manage'" -Completed
-                    Write-Host "  - Remove $numberOfUsers user(s) from 'Read and Manage': " -NoNewLine -ForegroundColor $colorText
-                    Write-Host "OK" -ForegroundColor $colorOK
-                } else {
-                    Write-Host "  - No users to be removed from 'Read and Manage'" -ForegroundColor $colorOK
-                }
-
-                $numberOfUsers = $removeSendAs.Count
-                if($numberOfUsers -gt 0) {
-                    $pct = 0
-                    $pctstep = 100 / $numberOfUsers
-                    ForEach($user in $removeSendAs) {
-                        $pct += $pctstep
-                        [int]$step = $pct
-                        Write-Progress -Activity "  - Remove $numberOfUsers user(s) from 'Send As'" -Status "$step%" -PercentComplete $pct
-                        $dummy = Remove-RecipientPermission -Identity $sharedMailBoxName -Trustee $user -AccessRights SendAs -Confirm:$false
-                    }
-                    Write-Progress -Activity "  - Remove $numberOfUsers user(s) from 'Send As'" -Completed
-                    Write-Host "  - Remove $numberOfUsers user(s) from 'Send As': " -NoNewLine -ForegroundColor $colorText
-                    Write-Host "OK" -ForegroundColor $colorOK
-                } else {
-                    Write-Host "  - No users to be removed from 'Send As'" -ForegroundColor $colorOK
-                }
-
-                # Add users that need access to each access type.
-                $numberOfUsers = $addRead.Count
-                if($numberOfUsers -gt 0) {
-                    $pct = 0
-                    $pctstep = 100 / $numberOfUsers
-                    ForEach($user in $addRead) {
-                        $pct += $pctstep
-                        [int]$step = $pct
-                        Write-Progress -Activity "  - Add $numberOfUsers user(s) to 'Read and Manage'" -Status "$step%" -PercentComplete $pct
-                        $dummy = Add-MailboxPermission -Identity $sharedMailBoxName -User $user -AccessRights FullAccess -Confirm:$false
-                    }
-                    Write-Progress -Activity "  - Add $numberOfUsers user(s) to 'Read and Manage'" -Completed
-                    Write-Host "  - Add $numberOfUsers user(s) to 'Read and Manage': " -NoNewLine -ForegroundColor $colorText
-                    Write-Host "OK" -ForegroundColor $colorOK
-                } else {
-                    Write-Host "  - No users to be added to 'Read and Manage'" -ForegroundColor $colorOK
-                }
-
-                $numberOfUsers = $addSendAs.Count
-                if($numberOfUsers -gt 0) {
-                    $pct = 0
-                    $pctstep = 100 / $numberOfUsers
-                    ForEach($user in $addSendAs) {
-                        $pct += $pctstep
-                        [int]$step = $pct
-                        Write-Progress -Activity "  - Add $numberOfUsers user(s) to 'Send As'" -Status "$step%" -PercentComplete $pct
-                        $dummy = Add-RecipientPermission -Identity $sharedMailBoxName -Trustee $user -AccessRights SendAs -Confirm:$false
-                    }
-                    Write-Progress -Activity "  - Add $numberOfUsers user(s) to 'Send As'" -Completed
-                    Write-Host "  - Add $numberOfUsers user(s) to 'Send As': " -NoNewLine -ForegroundColor $colorText
-                    Write-Host "OK" -ForegroundColor $colorOK
-                } else {
-                    Write-Host "  - No users to be added to 'Send As'" -ForegroundColor $colorOK
-                }
-    
+            if (-not $sharedMailboxName) {
+                continue
             }
 
-        }
+            Write-Host "`nShared Mailbox: " -ForegroundColor $script:ColorText -NoNewline
+            Write-Host $sharedMailboxName -ForegroundColor White
 
+            # Collect users who should have each permission type
+            $desiredReadUsers = @()
+            $desiredSendAsUsers = @()
+
+            for ($rowIndex = 2; $rowIndex -le $worksheet.Dimension.Rows; $rowIndex++) {
+                $activeRow = $worksheet.Cells.Item($rowIndex, 5).Text
+
+                if ($activeRow -ne 'Yes') {
+                    continue
+                }
+
+                $rights = $worksheet.Cells.Item($rowIndex, $colIndex).Text
+
+                # Check for Read and Manage rights
+                if ($rights -like '*[Rr]*') {
+                    $desiredReadUsers += $userLists[$rowIndex]
+                }
+
+                # Check for Send As rights
+                if ($rights -like '*[Ss]*') {
+                    $desiredSendAsUsers += $userLists[$rowIndex]
+                }
+            }
+
+            # Remove duplicates and extract UPNs
+            $desiredReadUsers = $desiredReadUsers |
+                                Sort-Object -Property UserPrincipalName -Unique |
+                                Select-Object -ExpandProperty UserPrincipalName
+
+            $desiredSendAsUsers = $desiredSendAsUsers |
+                                  Sort-Object -Property UserPrincipalName -Unique |
+                                  Select-Object -ExpandProperty UserPrincipalName
+
+            Write-Host "  - $($desiredReadUsers.Count) user(s) need 'Read and Manage' access." -ForegroundColor $script:ColorText
+            Write-Host "  - $($desiredSendAsUsers.Count) user(s) need 'Send As' access." -ForegroundColor $script:ColorText
+
+            # Synchronize permissions
+            Sync-MailboxPermissions -MailboxName $sharedMailboxName -DesiredReadUsers $desiredReadUsers -DesiredSendAsUsers $desiredSendAsUsers
+        }
     }
 
+    Write-Host ""
+    Write-Host "-------------------------------------------------------------------------------------" -ForegroundColor $script:ColorText
+    Write-Host "Script executed successfully." -ForegroundColor $script:ColorOK
+    Write-Host "-------------------------------------------------------------------------------------" -ForegroundColor $script:ColorText
+    Write-Host ""
+}
+catch {
+    Write-Host ""
+    Write-Host "-------------------------------------------------------------------------------------" -ForegroundColor $script:ColorError
+    Write-Host "Script execution failed!" -ForegroundColor $script:ColorError
+    Write-Host "Error: $_" -ForegroundColor $script:ColorError
+    Write-Host "-------------------------------------------------------------------------------------" -ForegroundColor $script:ColorError
+    Write-Host ""
+    throw
+}
+finally {
+    # Cleanup temporary file
+    if (Test-Path -Path $script:TempExcelFile) {
+        Write-Verbose "Removing temporary Excel file..."
+        Remove-Item -Path $script:TempExcelFile -Force -ErrorAction SilentlyContinue
+    }
+
+    # Disconnect from Exchange Online
+    Disconnect-M365ExchangeOnline
 }
 
-# When all is done, remove the local copy of the Excel workbook and close the Microsoft 365 connection.
-Remove-Item ".\input.xslx"
-CloseConnectionExchange
-
-Write-Host ""
-Write-Host "-------------------------------------------------------------------------------------" -ForegroundColor $colorText
-Write-Host "Script executed successfuly." -ForegroundColor $colorOK
-Write-Host "-------------------------------------------------------------------------------------" -ForegroundColor $colorText
-Write-Host ""
-Write-Host ""
+#endregion Main Script
